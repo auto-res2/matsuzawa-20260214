@@ -25,3 +25,15 @@ dependencies = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# [VALIDATOR FIX - Attempt 1]
+# [PROBLEM]: hatchling build backend cannot find project files
+# [CAUSE]: pyproject.toml does not specify where the package is located; hatchling looks for a directory named "erl_sc_experiments" (normalized from "erl-sc-experiments") but cannot find it
+# [FIX]: Added [tool.hatch.build.targets.wheel] section to specify that the package is in src/
+#
+# [OLD CODE]:
+# (no tool.hatch.build.targets.wheel section existed)
+#
+# [NEW CODE]:
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
