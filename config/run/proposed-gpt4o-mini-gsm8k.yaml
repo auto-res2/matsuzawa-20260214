@@ -1,0 +1,33 @@
+# ERL-SC on GSM8K with GPT-4o-mini
+run_id: proposed-gpt4o-mini-gsm8k
+
+method:
+  name: erl_sc
+  type: proposed
+  # ERL-SC parameters
+  m_min: 5  # minimum samples before stopping
+  m_max: 40  # maximum samples (budget limit)
+  tau: 0.85  # confidence threshold for early stopping
+  margin: 0.15  # minimum margin between top and runner-up AEC
+  fuzzy_threshold: 0.80  # string similarity threshold for AEC clustering
+  temperature: 0.7
+  top_p: 0.95
+
+model:
+  provider: openai
+  name: gpt-4o-mini
+  max_tokens: 512
+
+dataset:
+  name: gsm8k
+  split: test
+  max_samples: 200  # reduced for testing, full would be 1319
+
+inference:
+  batch_size: 1  # sequential sampling required for ERL-SC
+  num_seeds: 3  # repeat for 3 random seeds
+
+wandb:
+  entity: airas
+  project: 2026-02-14
+  mode: online

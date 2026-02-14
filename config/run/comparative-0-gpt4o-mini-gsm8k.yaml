@@ -1,0 +1,30 @@
+# Baseline Self-Consistency on GSM8K with GPT-4o-mini
+run_id: comparative-0-gpt4o-mini-gsm8k
+
+method:
+  name: baseline_sc
+  type: comparative
+  index: 0
+  # Standard SC parameters
+  m_fixed: 40  # fixed budget (same as ERL-SC max)
+  temperature: 0.7
+  top_p: 0.95
+
+model:
+  provider: openai
+  name: gpt-4o-mini
+  max_tokens: 512
+
+dataset:
+  name: gsm8k
+  split: test
+  max_samples: 200  # reduced for testing, full would be 1319
+
+inference:
+  batch_size: 1
+  num_seeds: 3  # repeat for 3 random seeds
+
+wandb:
+  entity: airas
+  project: 2026-02-14
+  mode: online
