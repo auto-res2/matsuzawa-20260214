@@ -1,0 +1,186 @@
+name: "Run Sanity Check"
+run-name: "Sanity Check: ${{ inputs.run_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name (e.g., main)'
+      run_id:
+        description: 'A single run_id to process'
+        required: true
+      runner_label:
+        description: 'Runner label (e.g., ["ubuntu-latest"], ["self-hosted", "gpu-runner"])'
+        required: true
+        default: '["ubuntu-latest"]'
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RESULTS_DIR: ".research/results"
+
+jobs:
+  run-sanity-check:
+    name: Run Sanity Check for ${{ github.event.inputs.run_id }}
+    runs-on: ${{ fromJSON(github.event.inputs.runner_label) }}
+    timeout-minutes: 120
+
+    outputs:
+      sanity_passed: ${{ steps.check-result.outputs.passed }}
+
+    env:
+      RUN_ID: ${{ github.event.inputs.run_id }}
+      # LLM inference experiments may use these provider keys.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Docker and Dockerfile availability
+        id: check-docker
+        run: |
+          has_docker=false
+          has_dockerfile=false
+
+          if docker info > /dev/null 2>&1; then
+            has_docker=true
+            echo "Docker is available"
+          else
+            echo "Docker is not available, will use native execution"
+          fi
+
+          if [ -f "Dockerfile" ]; then
+            has_dockerfile=true
+            echo "Dockerfile found"
+          else
+            echo "Dockerfile not found"
+          fi
+
+          echo "has_docker=$has_docker" >> "$GITHUB_OUTPUT"
+          echo "has_dockerfile=$has_dockerfile" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare results dir
+        run: mkdir -p "$RESULTS_DIR"
+
+      - name: Build Docker image
+        if: steps.check-docker.outputs.has_docker == 'true' && steps.check-docker.outputs.has_dockerfile == 'true'
+        id: build-docker
+        continue-on-error: true
+        run: |
+          (
+            set -e
+            echo "=== [DOCKER BUILD] Start at $(date -u) ==="
+            docker build -t airas-experiment:latest .
+            echo "=== [DOCKER BUILD] Success at $(date -u) ==="
+          ) 2>&1 | tee -a "$RESULTS_DIR/docker_build.log"
+
+          # Capture exit status
+          exit_status=${PIPESTATUS[0]}
+          if [ $exit_status -ne 0 ]; then
+            echo "::warning::Docker build failed (exit $exit_status), will fall back to native execution"
+            cat "$RESULTS_DIR/docker_build.log" >> "$RESULTS_DIR/stderr.txt"
+          fi
+          exit 0  # Always succeed to allow fallback
+
+      - name: Install uv (fallback if no Docker)
+        if: steps.check-docker.outputs.has_docker == 'false' || steps.check-docker.outputs.has_dockerfile == 'false' || steps.build-docker.outcome != 'success'
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run sanity check (Docker)
+        if: steps.check-docker.outputs.has_docker == 'true' && steps.check-docker.outputs.has_dockerfile == 'true' && steps.build-docker.outcome == 'success'
+        id: run-exp-docker
+        continue-on-error: true
+        run: |
+          trap 'sleep 1' EXIT
+
+          # Check GPU availability
+          GPU_FLAGS=""
+          if nvidia-smi > /dev/null 2>&1; then
+            echo "GPU detected, enabling GPU support"
+            GPU_FLAGS="--gpus all"
+          else
+            echo "No GPU detected, running without GPU support"
+          fi
+
+          docker run --rm $GPU_FLAGS \
+            -v "$(pwd)/$RESULTS_DIR:/workspace/$RESULTS_DIR" \
+            -e ANTHROPIC_API_KEY \
+            -e AWS_BEARER_TOKEN_BEDROCK \
+            -e GEMINI_API_KEY \
+            -e HF_TOKEN \
+            -e LANGFUSE_BASE_URL \
+            -e LANGFUSE_PUBLIC_KEY \
+            -e LANGFUSE_SECRET_KEY \
+            -e OPENAI_API_KEY \
+            -e OPENROUTER_API_KEY \
+            -e WANDB_API_KEY \
+            airas-experiment:latest \
+            bash -c '
+              set -e
+              set -o pipefail
+              echo "=== [SANITY RUN] Start for '"$RUN_ID"' at $(date -u) ==="
+              uv run python -u -m src.main run='"$RUN_ID"' results_dir="$RESULTS_DIR" mode=sanity_check
+              echo -e "=== [SANITY RUN] PASSED for '"$RUN_ID"' at $(date -u) ===\n"
+            ' > >(tee -a "$RESULTS_DIR/stdout.txt") 2> >(tee -a "$RESULTS_DIR/stderr.txt" >&2)
+
+      - name: Run sanity check (native)
+        if: steps.check-docker.outputs.has_docker == 'false' || steps.check-docker.outputs.has_dockerfile == 'false' || steps.build-docker.outcome != 'success'
+        id: run-exp-native
+        continue-on-error: true
+        run: |
+          trap 'sleep 1' EXIT
+          (
+            set -e
+            set -o pipefail
+
+            echo "=== [UV SYNC] Start at $(date -u) ==="
+            uv sync
+            echo "=== [UV SYNC] Finished successfully at $(date -u) ==="
+
+            echo "=== [SANITY RUN] Start for $RUN_ID at $(date -u) ==="
+            uv run python -u -m src.main \
+              run=$RUN_ID \
+              results_dir="$RESULTS_DIR" \
+              mode=sanity_check
+            echo -e "=== [SANITY RUN] PASSED for $RUN_ID at $(date -u) ===\n"
+          )> >(tee -a "$RESULTS_DIR/stdout.txt") 2> >(tee -a "$RESULTS_DIR/stderr.txt" >&2)
+
+      - name: Check result
+        id: check-result
+        run: |
+          outcome="${{ steps.run-exp-docker.outcome }}${{ steps.run-exp-native.outcome }}"
+          if [[ "$outcome" == *"success"* ]] \
+            && grep -q "\[SANITY RUN\] PASSED" "$RESULTS_DIR/stdout.txt" \
+            && grep -q "SANITY_VALIDATION: PASS" "$RESULTS_DIR/stdout.txt"; then
+            echo "Sanity check passed for $RUN_ID"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Sanity check failed for $RUN_ID"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanity-${{ github.run_id }}-${{ env.RUN_ID }}
+          path: ${{ env.RESULTS_DIR }}

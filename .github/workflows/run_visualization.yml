@@ -1,0 +1,184 @@
+name: "Run Visualization"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name (e.g., main)'
+      run_ids:
+        description: 'A JSON array of run_ids to process'
+        required: true
+      runner_label:
+        description: 'Runner label (e.g., ["ubuntu-latest"], ["self-hosted", "gpu-runner"])'
+        required: false
+        default: '["ubuntu-latest"]'
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RESULTS_DIR: ".research/results"
+
+jobs:
+  run-visualization:
+    name: Run Visualization
+    runs-on: ${{ fromJSON(github.event.inputs.runner_label) }}
+    timeout-minutes: 120
+
+    env:
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch_name }}
+
+      - name: Check Docker and Dockerfile availability
+        id: check-docker
+        run: |
+          has_docker=false
+          has_dockerfile=false
+
+          if docker info > /dev/null 2>&1; then
+            has_docker=true
+            echo "Docker is available"
+          else
+            echo "Docker is not available, will use native execution"
+          fi
+
+          if [ -f "Dockerfile" ]; then
+            has_dockerfile=true
+            echo "Dockerfile found"
+          else
+            echo "Dockerfile not found"
+          fi
+
+          echo "has_docker=$has_docker" >> "$GITHUB_OUTPUT"
+          echo "has_dockerfile=$has_dockerfile" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare results dir
+        run: mkdir -p "$RESULTS_DIR"
+
+      - name: Build Docker image
+        if: steps.check-docker.outputs.has_docker == 'true' && steps.check-docker.outputs.has_dockerfile == 'true'
+        id: build-docker
+        continue-on-error: true
+        run: |
+          (
+            set -e
+            echo "=== [DOCKER BUILD] Start at $(date -u) ==="
+            docker build -t airas-experiment:latest .
+            echo "=== [DOCKER BUILD] Success at $(date -u) ==="
+          ) 2>&1 | tee -a "$RESULTS_DIR/docker_build.log"
+
+          # Capture exit status
+          exit_status=${PIPESTATUS[0]}
+          if [ $exit_status -ne 0 ]; then
+            echo "::warning::Docker build failed (exit $exit_status), will fall back to native execution"
+            cat "$RESULTS_DIR/docker_build.log" >> "$RESULTS_DIR/stderr.txt"
+          fi
+          exit 0  # Always succeed to allow fallback
+
+      - name: Install uv (fallback if no Docker)
+        if: steps.check-docker.outputs.has_docker == 'false' || steps.check-docker.outputs.has_dockerfile == 'false' || steps.build-docker.outcome != 'success'
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: false
+
+      - name: Run visualization (Docker)
+        if: steps.check-docker.outputs.has_docker == 'true' && steps.check-docker.outputs.has_dockerfile == 'true' && steps.build-docker.outcome == 'success'
+        id: run-viz-docker
+        continue-on-error: true
+        run: |
+          trap 'sleep 1' EXIT
+
+          # Check GPU availability
+          GPU_FLAGS=""
+          if nvidia-smi > /dev/null 2>&1; then
+            echo "GPU detected, enabling GPU support"
+            GPU_FLAGS="--gpus all"
+          else
+            echo "No GPU detected, running without GPU support"
+          fi
+
+          docker run --rm $GPU_FLAGS \
+            -v "$(pwd)/$RESULTS_DIR:/workspace/$RESULTS_DIR" \
+            -e WANDB_API_KEY \
+            -e RESULTS_DIR="$RESULTS_DIR" \
+            airas-experiment:latest \
+            bash -c '
+              set -e
+              set -o pipefail
+              echo "=== [VISUALIZATION] Start at $(date -u) ==="
+              uv run python -u -m src.evaluate results_dir="$RESULTS_DIR" run_ids='"'"'${{ github.event.inputs.run_ids }}'"'"'
+              echo "=== [VISUALIZATION] PASSED at $(date -u) ==="
+            ' > >(tee -a "$RESULTS_DIR/stdout.txt") 2> >(tee -a "$RESULTS_DIR/stderr.txt" >&2)
+
+      - name: Run visualization (native)
+        if: steps.check-docker.outputs.has_docker == 'false' || steps.check-docker.outputs.has_dockerfile == 'false' || steps.build-docker.outcome != 'success'
+        id: run-viz-native
+        continue-on-error: true
+        run: |
+          trap 'sleep 1' EXIT
+          (
+            set -e
+            set -o pipefail
+
+            echo "=== [UV SYNC] Start at $(date -u) ==="
+            uv sync
+            echo "=== [UV SYNC] Finished successfully at $(date -u) ==="
+
+            echo "=== [VISUALIZATION] Start at $(date -u) ==="
+            uv run python -u -m src.evaluate \
+              results_dir="$RESULTS_DIR" \
+              run_ids='${{ github.event.inputs.run_ids }}'
+            echo "=== [VISUALIZATION] PASSED at $(date -u) ==="
+          ) > >(tee -a "$RESULTS_DIR/stdout.txt") 2> >(tee -a "$RESULTS_DIR/stderr.txt" >&2)
+
+      - name: Check visualization results
+        id: check-result
+        run: |
+          outcome="${{ steps.run-viz-docker.outcome }}${{ steps.run-viz-native.outcome }}"
+          if [[ "$outcome" == *"success"* ]] \
+            && find "$RESULTS_DIR" -type f \( -name "*.pdf" -o -name "*.png" \) | read; then
+            echo "Visualization results found."
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Visualization results missing or visualization failed."
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visualization-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Commit and push visualization results
+        if: steps.check-result.outputs.passed == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git add "$RESULTS_DIR"
+
+          if ! git diff --staged --quiet; then
+            git commit -m "[CI] Commit visualization results (${{ env.RESULTS_DIR }})"
+            for i in {1..5}; do
+              git pull --rebase -X theirs origin ${{ github.event.inputs.branch_name }}
+              git push && break
+              echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+              sleep $((2**i))
+            done
+          else
+            echo "No changes from visualization."
+          fi
