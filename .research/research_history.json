@@ -1,0 +1,8 @@
+{
+  "research_topic": "Proposing an improved Chain-of-Thought based on human thinking methods, evaluated purely through prompt tuning without fine-tuning or time-intensive experiments",
+  "queries": [
+    "chain-of-thought prompting",
+    "prompt tuning LLM",
+    "self-consistency prompting"
+  ]
+}
