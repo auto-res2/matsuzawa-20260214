@@ -17,21 +17,28 @@ def main(cfg: DictConfig) -> None:
     Main orchestrator for a single run.
     Applies mode overrides and invokes inference.py as a subprocess.
     """
-    # [VALIDATOR FIX - Attempt 1]
-    # [PROBLEM]: inference.py fails with "Missing key dataset"
-    # [CAUSE]: Hydra loads run config under cfg.run.* but inference.py expects dataset/model/method at top level
-    # [FIX]: Merge run config keys to top level before processing, keeping cfg.run.run_id accessible
+    # [VALIDATOR FIX - Attempt 2]
+    # [PROBLEM]: ConfigKeyError: Key 'run_id' is not in struct at line 34
+    # [CAUSE]: cfg is in struct mode, so adding new keys like 'run_id' raises an error
+    # [FIX]: Disable struct mode before merging, or use OmegaConf.merge() which handles this correctly
     #
     # [OLD CODE]:
-    # (no merge logic existed)
+    # if "run" in cfg and isinstance(cfg.run, DictConfig):
+    #     for key in cfg.run:
+    #         if key not in cfg:
+    #             cfg[key] = cfg.run[key]
     #
     # [NEW CODE]:
     # Merge run config to top level if it exists
     if "run" in cfg and isinstance(cfg.run, DictConfig):
+        # Use OmegaConf.set_struct to allow adding new keys
+        OmegaConf.set_struct(cfg, False)
         # Extract keys from cfg.run and merge to top level
         for key in cfg.run:
             if key not in cfg:
                 cfg[key] = cfg.run[key]
+        # Re-enable struct mode to catch typos later
+        OmegaConf.set_struct(cfg, True)
     
     # Apply mode overrides
     if cfg.mode == "sanity_check":
