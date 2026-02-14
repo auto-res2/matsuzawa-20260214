@@ -89,11 +89,20 @@ def load_strategyqa(split: str = "test", max_samples: int = None, cache_dir: str
     Returns:
         List of dataset samples with keys: question, answer, prompt
     """
-    # StrategyQA uses train split for main dataset
-    if split == "test":
-        split = "train"
-    
-    dataset = load_dataset("wics/strategy-qa", split=split, cache_dir=cache_dir)
+    # [VALIDATOR FIX - Attempt 1]
+    # [PROBLEM]: RuntimeError: Dataset scripts are no longer supported, but found strategy-qa.py
+    # [CAUSE]: The dataset "wics/strategy-qa" uses a Python loading script which is no longer supported in recent versions of datasets library (>= 3.0)
+    # [FIX]: Changed to use "ChilleD/StrategyQA" which is a script-free version of the dataset available on HuggingFace Hub.
+    #        Also removed the split conversion logic (test -> train) because ChilleD/StrategyQA has proper train/test splits.
+    #
+    # [OLD CODE]:
+    # # StrategyQA uses train split for main dataset
+    # if split == "test":
+    #     split = "train"
+    # dataset = load_dataset("wics/strategy-qa", split=split, cache_dir=cache_dir)
+    #
+    # [NEW CODE]:
+    dataset = load_dataset("ChilleD/StrategyQA", split=split, cache_dir=cache_dir)
     
     samples = []
     for i, item in enumerate(dataset):
