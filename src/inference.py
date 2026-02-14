@@ -207,7 +207,8 @@ def run_erl_sc(
     sample: Dict[str, Any],
     llm: Any,
     method_config: Dict[str, Any],
-    mode: str = "main"
+    mode: str = "main",
+    seed: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Run ERL-SC (Equivalence-Aware Risk-Limiting Self-Consistency) on a single sample.
@@ -217,6 +218,7 @@ def run_erl_sc(
         llm: LLM interface
         method_config: Method configuration
         mode: Execution mode (main, sanity_check, pilot)
+        seed: Random seed for LLM sampling
     
     Returns:
         Result dictionary with prediction, metrics, and intermediate data
@@ -238,8 +240,16 @@ def run_erl_sc(
     
     # Sequential sampling with early stopping
     for i in range(m_max):
-        # Generate completion
-        result = llm.generate(prompt, temperature=temperature, top_p=top_p)
+        # [VALIDATOR FIX - Attempt 1]
+        # [PROBLEM]: Different seeds produced nearly identical results across runs
+        # [CAUSE]: LLM generate() call did not receive seed parameter for reproducible sampling
+        # [FIX]: Pass seed parameter to llm.generate() to ensure reproducible LLM outputs
+        #
+        # [OLD CODE]:
+        # result = llm.generate(prompt, temperature=temperature, top_p=top_p)
+        #
+        # [NEW CODE]:
+        result = llm.generate(prompt, temperature=temperature, top_p=top_p, seed=seed)
         completions.append(result["text"])
         tokens_used += result["tokens"] + result["prompt_tokens"]
         
@@ -297,7 +307,8 @@ def run_baseline_sc(
     sample: Dict[str, Any],
     llm: Any,
     method_config: Dict[str, Any],
-    mode: str = "main"
+    mode: str = "main",
+    seed: Optional[int] = None
 ) -> Dict[str, Any]:
     """
     Run baseline Self-Consistency with fixed budget and exact-match voting.
@@ -307,6 +318,7 @@ def run_baseline_sc(
         llm: LLM interface
         method_config: Method configuration
         mode: Execution mode
+        seed: Random seed for LLM sampling
     
     Returns:
         Result dictionary
@@ -324,7 +336,16 @@ def run_baseline_sc(
     
     # Generate fixed number of samples
     for i in range(m_fixed):
-        result = llm.generate(prompt, temperature=temperature, top_p=top_p)
+        # [VALIDATOR FIX - Attempt 1]
+        # [PROBLEM]: Different seeds produced nearly identical results across runs
+        # [CAUSE]: LLM generate() call did not receive seed parameter for reproducible sampling
+        # [FIX]: Pass seed parameter to llm.generate() to ensure reproducible LLM outputs
+        #
+        # [OLD CODE]:
+        # result = llm.generate(prompt, temperature=temperature, top_p=top_p)
+        #
+        # [NEW CODE]:
+        result = llm.generate(prompt, temperature=temperature, top_p=top_p, seed=seed)
         completions.append(result["text"])
         tokens_used += result["tokens"] + result["prompt_tokens"]
         
@@ -415,14 +436,16 @@ def run_inference(cfg: DictConfig) -> None:
                     sample, 
                     llm, 
                     OmegaConf.to_container(cfg.method, resolve=True),
-                    cfg.mode
+                    cfg.mode,
+                    seed=seed
                 )
             else:
                 result = run_baseline_sc(
                     sample, 
                     llm, 
                     OmegaConf.to_container(cfg.method, resolve=True),
-                    cfg.mode
+                    cfg.mode,
+                    seed=seed
                 )
             
             result["seed"] = seed

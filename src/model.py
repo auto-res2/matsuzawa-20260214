@@ -47,6 +47,7 @@ class LLMInterface:
         prompt: str, 
         temperature: float = 0.7, 
         top_p: float = 0.95,
+        seed: Optional[int] = None,
         retry_on_error: bool = True,
         max_retries: int = 3,
     ) -> Dict[str, Any]:
@@ -57,6 +58,7 @@ class LLMInterface:
             prompt: Input prompt
             temperature: Sampling temperature
             top_p: Nucleus sampling parameter
+            seed: Random seed for reproducibility (OpenAI only)
             retry_on_error: Whether to retry on API errors
             max_retries: Maximum number of retries
         
@@ -70,13 +72,31 @@ class LLMInterface:
         for attempt in range(max_retries):
             try:
                 if self.provider == "openai":
-                    response = self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=self.max_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                    )
+                    # [VALIDATOR FIX - Attempt 1]
+                    # [PROBLEM]: Different seeds (42, 43, 44) produced nearly identical accuracy results (0.805, 0.805, 0.790)
+                    # [CAUSE]: OpenAI API calls did not include seed parameter, so LLM sampling was not reproducibly seeded
+                    # [FIX]: Added seed parameter to OpenAI API call when provided
+                    #
+                    # [OLD CODE]:
+                    # response = self.client.chat.completions.create(
+                    #     model=self.model_name,
+                    #     messages=[{"role": "user", "content": prompt}],
+                    #     max_tokens=self.max_tokens,
+                    #     temperature=temperature,
+                    #     top_p=top_p,
+                    # )
+                    #
+                    # [NEW CODE]:
+                    kwargs = {
+                        "model": self.model_name,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": self.max_tokens,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                    }
+                    if seed is not None:
+                        kwargs["seed"] = seed
+                    response = self.client.chat.completions.create(**kwargs)
                     
                     return {
                         "text": response.choices[0].message.content,
