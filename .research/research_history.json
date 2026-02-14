@@ -751,5 +751,105 @@
     "experimental_code": "import re\nimport math\nfrom decimal import Decimal, InvalidOperation\nfrom difflib import SequenceMatcher\nfrom collections import Counter\nimport numpy as np\n\n# -----------------------------\n# Canonicalization / extraction\n# -----------------------------\n_num_re = re.compile(r\"(-?\\d+(?:,\\d{3})*(?:\\.\\d+)?)\")\n_choice_re = re.compile(r\"\\b([A-E])\\b\", re.I)\n\ndef _canon_text(s: str) -> str:\n    s = s.strip().lower()\n    s = re.sub(r\"\\s+\", \" \", s)\n    s = re.sub(r\"[^a-z0-9\\./\\-\\s]\", \"\", s)\n    return s.strip()\n\n\ndef extract_answer(text: str, answer_type: str):\n    \"\"\"Return a canonical answer string or None.\n    answer_type: 'numeric' | 'bool' | 'mcq' | 'text'\n    \"\"\"\n    t = text.strip()\n\n    if answer_type == \"numeric\":\n        m = _num_re.findall(t.replace(\",\", \"\"))\n        if not m:\n            return None\n        x = m[-1]\n        try:\n            d = Decimal(x)\n            # normalize 4.0 -> 4, 004 -> 4\n            d = d.normalize()\n            # avoid scientific notation\n            return format(d, 'f').rstrip('0').rstrip('.') if '.' in format(d, 'f') else format(d, 'f')\n        except InvalidOperation:\n            return None\n\n    if answer_type == \"bool\":\n        c = _canon_text(t)\n        # capture common variants\n        if re.search(r\"\\b(yes|true|correct)\\b\", c):\n            return \"yes\"\n        if re.search(r\"\\b(no|false|incorrect)\\b\", c):\n            return \"no\"\n        return None\n\n    if answer_type == \"mcq\":\n        m = _choice_re.findall(t)\n        if not m:\n            # sometimes appears as \"answer: c\" without standalone token\n            m2 = re.search(r\"answer\\s*[:\\-]?\\s*([a-e])\", t, re.I)\n            if not m2:\n                return None\n            return m2.group(1).upper()\n        return m[-1].upper()\n\n    # text\n    c = _canon_text(t)\n    return c if c else None\n\n\n# -----------------------------\n# Online equivalence-class vote\n# -----------------------------\n\ndef sim(a: str, b: str) -> float:\n    return SequenceMatcher(a=a, b=b).ratio()\n\n\ndef aec_update(clusters, ans, thresh=0.92):\n    \"\"\"clusters: list of dicts {rep, count}. Returns index.\"\"\"\n    if ans is None:\n        return None\n    best_i, best_s = None, -1.0\n    for i, cl in enumerate(clusters):\n        s = sim(ans, cl[\"rep\"])\n        if s > best_s:\n            best_s, best_i = s, i\n    if best_i is not None and best_s >= thresh:\n        clusters[best_i][\"count\"] += 1\n        return best_i\n    clusters.append({\"rep\": ans, \"count\": 1})\n    return len(clusters) - 1\n\n\n# -----------------------------\n# Conservative 1-sided LB for Beta\n# -----------------------------\n\ndef beta_lb(a, b, z=1.6448536269514722):\n    # normal approx; ok for quick demo\n    mean = a / (a + b)\n    var = (a * b) / (((a + b) ** 2) * (a + b + 1))\n    return float(max(0.0, mean - z * math.sqrt(max(var, 1e-12))))\n\n\n# -----------------------------\n# ERL-SC decoding\n# -----------------------------\n\ndef erl_sc(generate_fn, prompt, answer_type,\n           m_max=40, m_min=5, tau=0.85, alpha=0.5,\n           fuzzy_thresh=0.92, margin_g=2):\n    clusters = []\n    t_eff = 0\n\n    for t in range(1, m_max + 1):\n        out = generate_fn(prompt)\n        ans = extract_answer(out, answer_type)\n        idx = aec_update(clusters, ans, thresh=fuzzy_thresh)\n        if idx is None:\n            continue\n        t_eff += 1\n\n        if t_eff < m_min or len(clusters) == 0:\n            continue\n\n        # sort counts\n        counts = sorted([cl[\"count\"] for cl in clusters], reverse=True)\n        c1 = counts[0]\n        c2 = counts[1] if len(counts) > 1 else 0\n        K = len(clusters)\n\n        a = c1 + alpha\n        b = (t_eff - c1) + alpha * max(1, (K - 1))\n        lb = beta_lb(a, b)\n\n        if lb >= tau and (c1 - c2) >= margin_g:\n            # return representative of top cluster\n            top = max(clusters, key=lambda d: d[\"count\"])\n            return top[\"rep\"], t  # t: model calls used\n\n    if not clusters:\n        return None, m_max\n    top = max(clusters, key=lambda d: d[\"count\"])\n    return top[\"rep\"], m_max\n\n\n# -----------------------------\n# Fixed SC baselines\n# -----------------------------\n\ndef fixed_sc(generate_fn, prompt, answer_type, m=40, use_aec=False, fuzzy_thresh=0.92):\n    if not use_aec:\n        c = Counter()\n        for _ in range(m):\n            out = generate_fn(prompt)\n            ans = extract_answer(out, answer_type)\n            if ans is not None:\n                c[ans] += 1\n        return c.most_common(1)[0][0] if c else None\n\n    clusters = []\n    for _ in range(m):\n        out = generate_fn(prompt)\n        ans = extract_answer(out, answer_type)\n        aec_update(clusters, ans, thresh=fuzzy_thresh)\n    if not clusters:\n        return None\n    return max(clusters, key=lambda d: d[\"count\"])[\"rep\"]\n",
     "expected_result": "Across tasks, ERL-SC is expected to improve the *accuracy–cost* frontier by reducing vote fragmentation.\n\nOn GSM8K (first 200 test; small instruct model):\n- Fixed SC (m=40, exact-match): accuracy ≈ 0.48–0.55.\n- CT-SC (exact-match early stop, τ=0.85): accuracy ≈ within ±0.5 pt of fixed SC; avg samples ≈ 16–24.\n- ERL-SC (τ=0.85, fuzzy=0.92, g=2): accuracy ≈ +1 to +3 pts over CT-SC at similar avg samples (≈ 16–24), because numeric formatting variants are merged and consensus emerges earlier.\n\nOn StrategyQA (boolean; 200 examples):\n- ERL-SC should match CT-SC accuracy (format variation is smaller) but reduce avg samples by ~10–25% due to more stable yes/no canonicalization.\n\nOn CommonsenseQA (MCQ; 200 dev examples):\n- Accuracy expected to be similar across SC variants, but ERL-SC should reduce early-stop errors by the margin rule, yielding slightly better or equal accuracy than CT-SC while using fewer samples.\n\nOverall quantitative prediction (aggregate over the 4 tasks, macro-average):\n- ERL-SC accuracy: +0.5 to +2.0 points vs CT-SC.\n- ERL-SC avg samples: 40–60% fewer than fixed m=40 SC (target 16–24 average).\nHigher accuracy is better; lower avg samples indicates lower inference cost.",
     "expected_conclusion": "ERL-SC strengthens self-consistency as a practical, socially valuable inference-time method by addressing a neglected failure mode: **surface-form fragmentation of correct answers**. By aggregating samples into online answer equivalence classes and applying a conservative, risk-limiting early-stop rule (posterior dominance + runner-up margin), ERL-SC achieves comparable or better accuracy than standard SC while using substantially fewer samples—purely via prompting/decoding changes.\n\nAcademic value: reframes SC as *sequential consensus over equivalence classes*, which is more general than exact-match majority vote and better connects SC to uncertainty estimation and selective prediction.\nPractical/social value: lowers latency, token cost, and energy use; improves reliability by preventing brittle early stops driven by formatting artifacts—without fine-tuning, extra models, or lengthy experiments."
+  },
+  "experimental_design": {
+    "experiment_summary": "Goal: demonstrate that Equivalence-Aware Risk-Limiting Self-Consistency (ERL-SC) improves *task accuracy per unit of sampling cost* for short-form QA by (i) aggregating model samples into answer-equivalence classes (AECs) rather than exact surface strings and (ii) using a conservative sequential stopping rule to terminate sampling early when conceptual agreement is sufficiently strong.\n\nTasks the model is expected to DO:\n- GSM8K: solve a grade-school math word problem and output a single final numeric answer.\n- StrategyQA: answer a yes/no question requiring implicit multi-hop commonsense reasoning and output a final boolean answer.\n\nOverall workflow (applies to both datasets):\n1) Prompting: use a single fixed few-shot CoT prompt per dataset that ends with a strict format requirement: `Final answer: <...>`.\n2) Sampling: for each question and each random seed, repeatedly sample one CoT completion at a time (temperature/top-p fixed) up to `m_max`.\n3) Answer extraction + AEC building (ERL-SC only): extract the final answer from each completion; canonicalize it (numeric/boolean rules + light text normalization) and cluster online into AECs (string similarity threshold for residual variation).\n4) Risk-limiting stopping (ERL-SC only): after `m_min` effective samples, compute a one-sided lower bound on the posterior probability that the current top AEC is truly dominant; stop early if it exceeds `τ` and the top-vs-runner-up margin is at least `g`.\n5) Baseline comparison: run standard fixed-budget Self-Consistency (SC) with exact-match majority vote at `m=40` using the same prompt and decoding settings.\n6) Evaluation: compute accuracy against gold answers and cost metrics (average model calls / tokens). Repeat for 3 seeds and report mean±std. Sweep `τ` (and optionally fuzzy threshold/margin) to produce an accuracy–cost Pareto curve.\n\nScale chosen to fit the provided Runner (single NVIDIA H200 140GB VRAM, 240GB RAM):\n- Datasets: only the first 200 examples from each dataset split used (400 total).\n- Seeds: 3 sampling seeds.\n- Sampling cap: `m_max=40` generations per question; ERL-SC typically stops earlier.\n- Max generation length: cap to `max_new_tokens=256` (sufficient for short CoT) to bound runtime and token cost.\nThis yields an upper bound of 400 * 3 * 40 = 48,000 generations, which is practical on an H200 with a 4B model in bf16.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria:\n- GSM8K (numeric): prediction is correct if the extracted numeric value equals the gold numeric value after normalization (strip commas/currency, parse as Decimal, normalize trailing zeros). If parsing fails, mark incorrect.\n- StrategyQA (boolean): prediction is correct if the extracted label in {\"yes\",\"no\"} matches the gold boolean (True→\"yes\", False→\"no\"). Unextractable outputs are incorrect.\n\nCalculation method:\n- For N evaluated questions, let I_i = 1 if prediction i is correct else 0. Accuracy = (1/N) * Σ_i I_i.\n- Report mean±std across 3 independent decoding seeds.\n\nTask appropriateness:\n- Both tasks are single-label short-answer tasks with unambiguous gold answers; accuracy directly measures end-task utility.\n\nRelevant visualizations:\n- Bar chart of accuracy by method and dataset (with error bars across seeds).\n- Accuracy vs. average samples curve (Pareto frontier) when sweeping ERL-SC stopping threshold τ."
+      },
+      {
+        "name": "avg_samples_per_question",
+        "description": "Correctness criteria:\n- Counts the number of model generations (sampling steps) actually executed per question (including those that yield an unextractable answer).\n\nCalculation method:\n- For question i, let s_i be the number of generations used (baseline: fixed m; ERL-SC: stopping time or m_max).\n- avg_samples_per_question = (1/N) * Σ_i s_i. Report mean±std across seeds.\n\nTask appropriateness:\n- SC-family methods trade accuracy for inference compute; model-call count is a hardware-agnostic compute proxy.\n\nRelevant visualizations:\n- Histogram / KDE of samples used per question (to show early-stop behavior).\n- Scatter plot of (avg_samples_per_question, accuracy) for each τ setting."
+      },
+      {
+        "name": "avg_generated_tokens_per_question",
+        "description": "Correctness criteria:\n- Measures total generated tokens (excluding prompt tokens) per question; requires tokenizer-based counting for each completion.\n\nCalculation method:\n- For question i, with completions j=1..s_i, let t_{ij} be the number of generated tokens. Tokens_i = Σ_j t_{ij}.\n- avg_generated_tokens_per_question = (1/N) * Σ_i Tokens_i. Report mean±std across seeds.\n\nTask appropriateness:\n- Token count correlates with latency and cost for decoder-only LMs; complements sample-count when completion lengths vary.\n\nRelevant visualizations:\n- Box plot of per-question generated tokens by method.\n- Accuracy vs. avg_generated_tokens_per_question Pareto curve (sweep τ)."
+      },
+      {
+        "name": "early_stop_rate",
+        "description": "Correctness criteria:\n- Only defined for adaptive methods (ERL-SC). A question is an early-stop if the stopping criterion triggers before reaching m_max.\n\nCalculation method:\n- Let E_i=1 if ERL-SC stops at s_i < m_max else 0. early_stop_rate = (1/N) * Σ_i E_i.\n\nTask appropriateness:\n- Directly quantifies adaptivity; high early-stop rate with maintained/improved accuracy supports the compute-saving claim.\n\nRelevant visualizations:\n- Line plot of early_stop_rate vs τ.\n- Joint plot of stopping time distribution vs correctness (e.g., stacked histogram: correct vs incorrect at each stop time)."
+      },
+      {
+        "name": "fragmentation_index",
+        "description": "Correctness criteria:\n- Captures the hypothesized failure mode: exact-match vote fragmentation. Defined per question as how dispersed the raw extracted answers are.\n\nCalculation method:\n- Run a fixed-budget sampling pass with m=40 and extract the raw (pre-AEC) canonicalized answers.\n- Let counts over unique raw strings be {n_k} with Σ_k n_k = m_eff (effective extracted samples). Compute normalized entropy H = -Σ_k (n_k/m_eff) log(n_k/m_eff).\n- Define fragmentation_index = exp(H) (effective number of distinct surface forms). Average across questions.\n- Optionally report the reduction in fragmentation when switching from exact-match strings to AECs (same formula computed over AEC IDs).\n\nTask appropriateness:\n- This metric directly operationalizes the paper’s core claim (surface-form variability hurts SC) and provides mechanistic evidence beyond accuracy.\n\nRelevant visualizations:\n- Violin plot of fragmentation_index per dataset.\n- Scatter plot: fragmentation_index vs whether fixed-SC was wrong but ERL-SC was correct (to link fragmentation to failures)."
+      }
+    ],
+    "models_to_use": [
+      "Qwen3-4B (4B parameters)"
+    ],
+    "datasets_to_use": [
+      "gsm8k",
+      "StrategyQA"
+    ],
+    "proposed_method": {
+      "method_name": "Equivalence-Aware Risk-Limiting Self-Consistency (ERL-SC)",
+      "description": "Inference-time, prompt-only self-consistency variant that (1) aggregates sampled answers into online answer-equivalence classes via canonicalization + lightweight similarity clustering, reducing vote fragmentation across paraphrases/formatting; and (2) applies a conservative sequential (risk-limiting) early-stopping rule using a one-sided lower bound on the top AEC’s dominance plus a runner-up margin constraint to avoid brittle early stops.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "tau",
+            "distribution_type": "categorical",
+            "choices": [
+              0.8,
+              0.85,
+              0.9
+            ]
+          },
+          {
+            "param_name": "fuzzy_thresh",
+            "distribution_type": "categorical",
+            "choices": [
+              0.88,
+              0.92
+            ]
+          },
+          {
+            "param_name": "margin_g",
+            "distribution_type": "categorical",
+            "choices": [
+              2,
+              3
+            ]
+          },
+          {
+            "param_name": "m_min",
+            "distribution_type": "categorical",
+            "choices": [
+              5,
+              7
+            ]
+          },
+          {
+            "param_name": "alpha",
+            "distribution_type": "categorical",
+            "choices": [
+              0.5,
+              1.0
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "Standard Self-Consistency (Fixed-SC, Exact-Match Voting)",
+        "description": "Baseline SC: sample m completions under the same CoT prompt and decoding settings; extract the final answer; choose the most frequent answer by exact string match (after minimal task-specific extraction only). No early stopping and no equivalence-class merging.",
+        "optuna_config": {
+          "enabled": false,
+          "n_trials": 20
+        }
+      }
+    ]
   }
 }
